@@ -95,6 +95,31 @@ static int  backend_loop(webview_shim_t *w, int blocking);
 static void backend_eval(webview_shim_t *w, const char *js);
 static void backend_exit(webview_shim_t *w);
 
+/* ── Internal structures ───────────────────────────────────────────── */
+#define WV_MAX_BINDINGS 64
+#define WV_MAX_INIT_SCRIPTS 32
+
+typedef struct {
+    char name[64];
+    webview_shim_bind_fn fn;
+    void *arg;
+} wv_binding_t;
+
+typedef struct wv_dispatch_item {
+    void (*fn)(webview_shim_t *w, void *arg);
+    void *arg;
+    struct wv_dispatch_item *next;
+} wv_dispatch_item_t;
+
+/* Simple spinlock helpers for dispatch queue */
+static inline int wv_lock(volatile int *lock) {
+    while (__sync_lock_test_and_set(lock, 1)) { /* spin */ }
+    return 0;
+}
+static inline void wv_unlock(volatile int *lock) {
+    __sync_lock_release(lock);
+}
+
 /* ── Per-platform private state ─────────────────────────────────────── */
 struct webview_shim_priv {
 	int   (*init)(webview_shim_t *w);
@@ -105,12 +130,26 @@ struct webview_shim_priv {
 	int    platform;     /* 0=macOS, 1=Linux, 2=Windows */
 	int    running;      /* 1 while window is open */
 	void  *native;       /* platform-specific native window pointer */
+	void  *nswindow;     /* macOS: NSWindow*; Linux: GtkWindow* */
 	void  *webview;      /* macOS: WKWebView*; Linux: WebKitWebView* */
 
+	/* Binding table */
+	wv_binding_t bindings[WV_MAX_BINDINGS];
+	int          bindings_count;
+
+	/* Dispatch queue (spinlock-protected) */
+	wv_dispatch_item_t *dispatch_head;
+	wv_dispatch_item_t *dispatch_tail;
+	volatile int        dispatch_lock;
+
+	/* Init scripts (runs at document start) */
+	char *init_scripts[WV_MAX_INIT_SCRIPTS];
+	int   init_scripts_count;
+
 	/* macOS cached ObjC runtime + msgSend variants */
-	void  *objc_lib;          /* cosmo_dlopen("libobjc.A.dylib") handle */
-	void  *ms_objc_getClass;  /* objc_getClass */
-	void  *ms_sel_registerName; /* sel_registerName */
+	void  *objc_lib;                /* cosmo_dlopen("libobjc.A.dylib") handle */
+	void  *ms_objc_getClass;        /* objc_getClass */
+	void  *ms_sel_registerName;     /* sel_registerName */
 	void  *fn_objc_msgSend;         /* objc_msgSend (variadic, void return) */
 	void  *fn_objc_msgSend_id;      /* objc_msgSend returning id */
 	void  *fn_objc_msgSend_id_id;   /* objc_msgSend(self, sel, id) -> id */
@@ -137,6 +176,7 @@ struct webview_shim_priv {
 	void  *fn_g_free;
 	void  *fn_wk_new;
 	void  *fn_wk_load_html;
+	void  *fn_wk_load_uri;
 	void  *fn_wk_get_settings;
 	void  *fn_wk_set_enable_scripts;
 	void  *fn_wk_set_enable_developer_extras;
@@ -153,7 +193,118 @@ struct webview_shim_priv {
 	void  *fn_TranslateMessage;
 	void  *fn_DispatchMessageW;
 	void  *fn_CoUninitialize;
+	void  *fn_PostMessageW;
 };
+
+/* ── Internal dispatch: drain pending dispatch items ────────────── */
+static void
+wv_drain_dispatch(webview_shim_priv *p, webview_shim_t *w)
+{
+    /* Swap out the queue under lock */
+    wv_dispatch_item_t *item = NULL;
+    wv_lock(&p->dispatch_lock);
+    item = p->dispatch_head;
+    p->dispatch_head = NULL;
+    p->dispatch_tail = NULL;
+    wv_unlock(&p->dispatch_lock);
+
+    while (item) {
+        wv_dispatch_item_t *next = item->next;
+        if (item->fn) item->fn(w, item->arg);
+        free(item);
+        item = next;
+    }
+}
+
+/* ── Internal invoke router: bindings first, then on_invoke ──────── */
+static void
+wv_handle_invoke(webview_shim_t *w, const char *arg)
+{
+    if (!w || !w->priv || !arg) return;
+
+    webview_shim_priv *p = w->priv;
+
+    /* Check for bind() call: {"__bind__":"name","__id__":"id","__args__":[...]} */
+    if (arg[0] == '{' && strstr(arg, "\"__bind__\"")) {
+        char bname[64] = {0};
+        char bid[128]  = {0};
+        const char *bkey, *pstr;
+
+        /* Extract __bind__ value */
+        bkey = strstr(arg, "\"__bind__\"");
+        if (bkey) {
+            pstr = strchr(bkey + 10, '"'); /* skip past "__bind__": */
+            if (pstr) {
+                pstr++;
+                const char *q = strchr(pstr, '"');
+                if (q) {
+                    size_t n = (size_t)(q - pstr);
+                    if (n < sizeof(bname)) { memcpy(bname, pstr, n); bname[n] = 0; }
+                }
+            }
+        }
+
+        /* Extract __id__ value */
+        bkey = strstr(arg, "\"__id__\"");
+        if (bkey) {
+            pstr = strchr(bkey + 8, '"');
+            if (pstr) {
+                pstr++;
+                const char *q = strchr(pstr, '"');
+                if (q) {
+                    size_t n = (size_t)(q - pstr);
+                    if (n < sizeof(bid)) { memcpy(bid, pstr, n); bid[n] = 0; }
+                }
+            }
+        }
+
+        /* Extract __args__ value — pass the JSON array as-is to callback */
+        if (bname[0] && bid[0]) {
+            char args_json[4096] = {0};
+            bkey = strstr(arg, "\"__args__\"");
+            if (bkey) {
+                pstr = bkey + 10; /* skip "__args__": */
+                /* Find the start of array/object — skip whitespace */
+                while (*pstr && *pstr != '[' && *pstr != '{') pstr++;
+                if (*pstr) {
+                    /* Match brackets — simplified: just find matching ] or } */
+                    char open = *pstr;
+                    char close = (open == '[') ? ']' : '}';
+                    int depth = 1;
+                    const char *q = pstr + 1;
+                    while (*q && depth > 0 && (size_t)(q - pstr) < sizeof(args_json) - 1) {
+                        if (*q == open) depth++;
+                        else if (*q == close) depth--;
+                        q++;
+                    }
+                    size_t n = (size_t)(q - pstr);
+                    if (n < sizeof(args_json)) {
+                        memcpy(args_json, pstr, n);
+                        args_json[n] = 0;
+                    }
+                }
+            }
+            /* If we couldn't extract args, pass an empty array */
+            if (!args_json[0]) {
+                memcpy(args_json, "[]", 3);
+            }
+
+            /* Look up binding and call it */
+            for (int i = 0; i < p->bindings_count; i++) {
+                if (strcmp(p->bindings[i].name, bname) == 0) {
+                    if (p->bindings[i].fn)
+                        p->bindings[i].fn(bid, args_json, p->bindings[i].arg);
+                    return;
+                }
+            }
+        }
+        return;
+    }
+
+    /* Not a bind call — forward to user's on_invoke */
+    if (w->on_invoke)
+        w->on_invoke(w, arg);
+}
 
 /* ═══════════════════════════════════════════════════════════════════════
    macOS / Cocoa + WebKit backend
@@ -274,11 +425,11 @@ nav_decide_policy(void *self, void *sel, void *webView, void *navigationAction, 
 	(void)sel;
 	(void)webView;
 
-	if (!g_active_webview || !g_active_webview->on_invoke)
+	if (!g_active_webview)
 		goto allow;
-
 	webview_shim_priv *p = g_active_webview->priv;
-	if (!p || !p->objc_lib) goto allow;
+	if (!p || !p->objc_lib || (!g_active_webview->on_invoke && p->bindings_count == 0))
+		goto allow;
 
 	msgSend_id_fn msg_id = (msgSend_id_fn)p->fn_objc_msgSend_id;
 	sel_registerName_t selReg = (sel_registerName_t)p->ms_sel_registerName;
@@ -321,7 +472,7 @@ nav_decide_policy(void *self, void *sel, void *webView, void *navigationAction, 
 		((void (*)(void *, unsigned long))invoke)(decisionHandler, 0);
 	}
 
-	g_active_webview->on_invoke(g_active_webview, decoded ? decoded : pstr);
+	wv_handle_invoke(g_active_webview, decoded ? decoded : pstr);
 	free(decoded);
 	return;
 
@@ -345,11 +496,11 @@ macos_backend_init(webview_shim_t *w)
 	   (called every frame) does NOT dlopen/dlsym repeatedly.  Doing so
 	   on every iteration would stall the run loop and prevent WKWebView
 	   from ever rendering content (dark grey window + beach ball). */
-	w->priv->objc_lib          = lib;
-	w->priv->ms_objc_getClass  = cosmo_dlsym(lib, "objc_getClass");
-	w->priv->ms_sel_registerName = cosmo_dlsym(lib, "sel_registerName");
-	w->priv->fn_objc_msgSend     = cosmo_dlsym(lib, "objc_msgSend");
-	w->priv->fn_objc_msgSend_id  = cosmo_dlsym(lib, "objc_msgSend");
+	w->priv->objc_lib              = lib;
+	w->priv->ms_objc_getClass      = cosmo_dlsym(lib, "objc_getClass");
+	w->priv->ms_sel_registerName   = cosmo_dlsym(lib, "sel_registerName");
+	w->priv->fn_objc_msgSend       = cosmo_dlsym(lib, "objc_msgSend");
+	w->priv->fn_objc_msgSend_id    = cosmo_dlsym(lib, "objc_msgSend");
 	w->priv->fn_objc_msgSend_id_id = cosmo_dlsym(lib, "objc_msgSend");
 
 	cosmo_dlopen("/System/Library/Frameworks/AppKit.framework/AppKit",
@@ -436,7 +587,7 @@ macos_backend_init(webview_shim_t *w)
 	/* Inject context-menu blocker via user script (before any page content) */
 	if (!w->context_menu) {
 		void *ucc = msg_id(config, sel_registerName("userContentController"));
-		void *src  = msg_id_id(NSStr_cls, sel_strWith,
+		void *src = msg_id_id(NSStr_cls, sel_strWith,
 		    "document.addEventListener('contextmenu',function(e){e.preventDefault();});");
 		/* WKUserScript.alloc.initWithSource:injectionTime:forMainFrameOnly:
 		   injectionTime 0 = AtDocumentStart */
@@ -461,15 +612,40 @@ macos_backend_init(webview_shim_t *w)
 	    ((msgSend_void_id_fn)msg_void)(webview,
 	        sel_registerName("setNavigationDelegate:"),
 	        msg_id(msg_id(delCls, sel_alloc), sel_init));
-	    /* Inject bootstrap: window.external.invoke navigates to about:blank?__invoke= */
+	    /* Inject bootstrap: binding infrastructure + window.external.invoke */
 	    void *bootstrapSrc = msg_id_id(NSStr_cls, sel_strWith,
-	        "window.external={invoke:function(m){window.location.href='about:blank?__invoke='+encodeURIComponent(m)}};");
+	        "window.__wv_pending={};"
+	        "window.__wv_bind_resolve=function(id,ok,r){"
+	        "var c=window.__wv_pending[id];if(!c)return;"
+	        "try{r=JSON.parse(r)}catch(e){}"
+	        "if(ok)c[0](r);else c[1](r);delete window.__wv_pending[id];};"
+	        "window.__wv_add_binding=function(n){"
+	        "if(window[n]&&window[n].__wv_bound)return;"
+	        "window[n]=function(){var i='__wv_'+Date.now()+'_'+Math.random().toString(36).slice(2);"
+	        "var a=Array.prototype.slice.call(arguments);"
+	        "return new Promise(function(s,f){"
+	        "window.__wv_pending[i]=[s,f];"
+	        "window.external.invoke(JSON.stringify({__bind__:n,__id__:i,__args__:a}));});};"
+	        "window[n].__wv_bound=true;};"
+	        "window.external={invoke:function(m){"
+	        "window.location.href='about:blank?__invoke='+encodeURIComponent(m)}};");
 	    void *usCls = objc_getClass("WKUserScript");
 	    void *bootstrapScript = msg_id(msg_id(usCls, sel_alloc),
 	        sel_registerName("initWithSource:injectionTime:forMainFrameOnly:"),
 	        bootstrapSrc, 0, 1);
 	    void *ucc = msg_id(config, sel_registerName("userContentController"));
-	    ((msgSend_void_id_fn)msg_void)(ucc, sel_registerName("addUserScript:"), bootstrapScript);
+	((msgSend_void_id_fn)msg_void)(ucc, sel_registerName("addUserScript:"), bootstrapScript);
+
+	    /* Inject queued init scripts at document start */
+	    for (int i_ = 0; i_ < w->priv->init_scripts_count; i_++) {
+	        if (!w->priv->init_scripts[i_]) continue;
+	        void *isrc = msg_id_id(NSStr_cls, sel_strWith,
+	            (void*)w->priv->init_scripts[i_]);
+	        void *uscript = msg_id(msg_id(usCls, sel_alloc),
+	            sel_registerName("initWithSource:injectionTime:forMainFrameOnly:"),
+	            isrc, 0, 1);
+	        ((msgSend_void_id_fn)msg_void)(ucc, sel_registerName("addUserScript:"), uscript);
+	    }
 	}
 
 	((msgSend_void_id_fn)msg_void)(msg_id(window, sel_registerName("contentView")),
@@ -500,6 +676,7 @@ macos_backend_init(webview_shim_t *w)
 	((msgSend_void_fn2)msg_void)(NSApp, sel_registerName("finishLaunching"));
 	((msgSend_void_bool_fn)msg_void)(NSApp, sel_registerName("activateIgnoringOtherApps:"), 1);
 
+	w->priv->nswindow = window;
 	w->priv->native  = NSApp;
 	w->priv->running = 1;
 	g_active_webview = w;
@@ -511,6 +688,9 @@ macos_backend_init(webview_shim_t *w)
 static int
 macos_backend_loop(webview_shim_t *w, int blocking)
 {
+	/* Drain any pending dispatch items first */
+	wv_drain_dispatch(w->priv, w);
+
 	/* Use cached ObjC runtime handle from init — NEVER dlopen here,
 	   as doing so every frame (~20 Hz) stalls the run loop and causes
 	   the beach ball + dark-grey WKWebView symptom. */
@@ -673,7 +853,8 @@ linux_script_message_received(void *manager, void *result, void *user_data)
 {
     (void)manager;
     webview_shim_t *w = (webview_shim_t *)user_data;
-    if (!w || !w->on_invoke || !w->priv->webkit_lib) return;
+    if (!w || !w->priv || !w->priv->webkit_lib) return;
+    if (!w->on_invoke && w->priv->bindings_count == 0) return;
 
     wk_js_result_get_js_value_fn_t get_js_val =
         (wk_js_result_get_js_value_fn_t)w->priv->fn_wk_js_result_get_js_value;
@@ -689,7 +870,7 @@ linux_script_message_received(void *manager, void *result, void *user_data)
     char *str = jsc_str(js_value);
     if (!str) return;
 
-    w->on_invoke(w, str);
+    	wv_handle_invoke(w, str);
 
     typedef void (*g_free_fn_t)(void*);
     g_free_fn_t g_free = (g_free_fn_t)w->priv->fn_g_free;
@@ -713,35 +894,36 @@ linux_backend_init(webview_shim_t *w)
     w->priv->webkit_lib = lib_wk;
 
     /* ── Cache ALL GTK function pointers ──────────────────────────── */
-    w->priv->fn_gtk_init                  = cosmo_dlsym(lib_gtk, "gtk_init");
-    w->priv->fn_gtk_window_new            = cosmo_dlsym(lib_gtk, "gtk_window_new");
-    w->priv->fn_gtk_window_set_title      = cosmo_dlsym(lib_gtk, "gtk_window_set_title");
+    w->priv->fn_gtk_init                    = cosmo_dlsym(lib_gtk, "gtk_init");
+    w->priv->fn_gtk_window_new              = cosmo_dlsym(lib_gtk, "gtk_window_new");
+    w->priv->fn_gtk_window_set_title        = cosmo_dlsym(lib_gtk, "gtk_window_set_title");
     w->priv->fn_gtk_window_set_default_size = cosmo_dlsym(lib_gtk, "gtk_window_set_default_size");
-    w->priv->fn_gtk_container_add         = cosmo_dlsym(lib_gtk, "gtk_container_add");
-    w->priv->fn_gtk_widget_show_all       = cosmo_dlsym(lib_gtk, "gtk_widget_show_all");
-    w->priv->fn_gtk_main                  = cosmo_dlsym(lib_gtk, "gtk_main");
-    w->priv->fn_gtk_main_quit             = cosmo_dlsym(lib_gtk, "gtk_main_quit");
-    w->priv->fn_gtk_events_pending        = cosmo_dlsym(lib_gtk, "gtk_events_pending");
-    w->priv->fn_gtk_main_iteration        = cosmo_dlsym(lib_gtk, "gtk_main_iteration");
-    w->priv->fn_gtk_window_set_resizable  = cosmo_dlsym(lib_gtk, "gtk_window_set_resizable");
-    w->priv->fn_g_signal_connect_data     = cosmo_dlsym(lib_gtk, "g_signal_connect_data");
-    w->priv->fn_g_object_unref            = cosmo_dlsym(lib_gtk, "g_object_unref");
-    w->priv->fn_g_free                    = cosmo_dlsym(lib_gtk, "g_free");
+    w->priv->fn_gtk_container_add           = cosmo_dlsym(lib_gtk, "gtk_container_add");
+    w->priv->fn_gtk_widget_show_all         = cosmo_dlsym(lib_gtk, "gtk_widget_show_all");
+    w->priv->fn_gtk_main                    = cosmo_dlsym(lib_gtk, "gtk_main");
+    w->priv->fn_gtk_main_quit               = cosmo_dlsym(lib_gtk, "gtk_main_quit");
+    w->priv->fn_gtk_events_pending          = cosmo_dlsym(lib_gtk, "gtk_events_pending");
+    w->priv->fn_gtk_main_iteration          = cosmo_dlsym(lib_gtk, "gtk_main_iteration");
+    w->priv->fn_gtk_window_set_resizable    = cosmo_dlsym(lib_gtk, "gtk_window_set_resizable");
+    w->priv->fn_g_signal_connect_data       = cosmo_dlsym(lib_gtk, "g_signal_connect_data");
+    w->priv->fn_g_object_unref              = cosmo_dlsym(lib_gtk, "g_object_unref");
+    w->priv->fn_g_free                      = cosmo_dlsym(lib_gtk, "g_free");
 
     /* ── Cache ALL WebKit function pointers ────────────────────────── */
-    w->priv->fn_wk_new                        = cosmo_dlsym(lib_wk, "webkit_web_view_new");
-    w->priv->fn_wk_load_html                  = cosmo_dlsym(lib_wk, "webkit_web_view_load_html");
-    w->priv->fn_wk_evaluate_javascript        = cosmo_dlsym(lib_wk, "webkit_web_view_evaluate_javascript");
-    w->priv->fn_wk_get_child                  = cosmo_dlsym(lib_wk, "gtk_bin_get_child");
-    w->priv->fn_wk_get_settings               = cosmo_dlsym(lib_wk, "webkit_web_view_get_settings");
-    w->priv->fn_wk_set_enable_scripts         = cosmo_dlsym(lib_wk, "webkit_settings_set_enable_scripts");
+    w->priv->fn_wk_new                         = cosmo_dlsym(lib_wk, "webkit_web_view_new");
+    w->priv->fn_wk_load_html                   = cosmo_dlsym(lib_wk, "webkit_web_view_load_html");
+    w->priv->fn_wk_load_uri                    = cosmo_dlsym(lib_wk, "webkit_web_view_load_uri");
+    w->priv->fn_wk_evaluate_javascript         = cosmo_dlsym(lib_wk, "webkit_web_view_evaluate_javascript");
+    w->priv->fn_wk_get_child                   = cosmo_dlsym(lib_wk, "gtk_bin_get_child");
+    w->priv->fn_wk_get_settings                = cosmo_dlsym(lib_wk, "webkit_web_view_get_settings");
+    w->priv->fn_wk_set_enable_scripts          = cosmo_dlsym(lib_wk, "webkit_settings_set_enable_scripts");
     w->priv->fn_wk_set_enable_developer_extras = cosmo_dlsym(lib_wk, "webkit_settings_set_enable_developer_extras");
-    w->priv->fn_wk_get_ucm                    = cosmo_dlsym(lib_wk, "webkit_web_view_get_user_content_manager");
-    w->priv->fn_wk_ucm_reg_msg                = cosmo_dlsym(lib_wk, "webkit_user_content_manager_register_script_message_handler");
-    w->priv->fn_wk_user_script_new            = cosmo_dlsym(lib_wk, "webkit_user_script_new");
-    w->priv->fn_wk_ucm_add_script             = cosmo_dlsym(lib_wk, "webkit_user_content_manager_add_script");
-    w->priv->fn_wk_js_result_get_js_value     = cosmo_dlsym(lib_wk, "webkit_javascript_result_get_js_value");
-    w->priv->fn_wk_jsc_value_to_string        = cosmo_dlsym(lib_wk, "jsc_value_to_string");
+    w->priv->fn_wk_get_ucm                     = cosmo_dlsym(lib_wk, "webkit_web_view_get_user_content_manager");
+    w->priv->fn_wk_ucm_reg_msg                 = cosmo_dlsym(lib_wk, "webkit_user_content_manager_register_script_message_handler");
+    w->priv->fn_wk_user_script_new             = cosmo_dlsym(lib_wk, "webkit_user_script_new");
+    w->priv->fn_wk_ucm_add_script              = cosmo_dlsym(lib_wk, "webkit_user_content_manager_add_script");
+    w->priv->fn_wk_js_result_get_js_value      = cosmo_dlsym(lib_wk, "webkit_javascript_result_get_js_value");
+    w->priv->fn_wk_jsc_value_to_string         = cosmo_dlsym(lib_wk, "jsc_value_to_string");
 
     /* Verify essential GTK symbols */
     if (!w->priv->fn_gtk_init || !w->priv->fn_gtk_window_new || !w->priv->fn_gtk_widget_show_all) {
@@ -796,8 +978,8 @@ linux_backend_init(webview_shim_t *w)
         }
     }
 
-    /* ── Inject bootstrap script for window.external.invoke ─────────── */
-    /* The script creates window.external.invoke = function(msg) {
+    /* ── Inject bootstrap script for binding + window.external.invoke ─── */
+    /* Inserts bind infrastructure + window.external.invoke = function(msg) {
            window.webkit.messageHandlers.external.postMessage(msg);
        } */
     if (w->priv->fn_wk_user_script_new && w->priv->fn_wk_ucm_add_script) {
@@ -805,6 +987,19 @@ linux_backend_init(webview_shim_t *w)
         void *ucm = ((wk_get_ucm_fn_t)w->priv->fn_wk_get_ucm)(webview);
         if (ucm) {
             void *script = ((wk_user_script_new_fn_t)w->priv->fn_wk_user_script_new)(
+                "window.__wv_pending={};"
+                "window.__wv_bind_resolve=function(id,ok,r){"
+                "var c=window.__wv_pending[id];if(!c)return;"
+                "try{r=JSON.parse(r)}catch(e){}"
+                "if(ok)c[0](r);else c[1](r);delete window.__wv_pending[id];};"
+                "window.__wv_add_binding=function(n){"
+                "if(window[n]&&window[n].__wv_bound)return;"
+                "window[n]=function(){var i='__wv_'+Date.now()+'_'+Math.random().toString(36).slice(2);"
+                "var a=Array.prototype.slice.call(arguments);"
+                "return new Promise(function(s,f){"
+                "window.__wv_pending[i]=[s,f];"
+                "window.external.invoke(JSON.stringify({__bind__:n,__id__:i,__args__:a}));});};"
+                "window[n].__wv_bound=true;};"
                 "window.external={invoke:function(m){"
                 "window.webkit.messageHandlers.external.postMessage(m)}};",
                 1,  /* WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES */
@@ -825,12 +1020,30 @@ linux_backend_init(webview_shim_t *w)
             "context-menu", (void *)ctx_block, NULL, NULL, 0);
     }
 
-    if (w->html && w->html[0])
-        ((webkit_web_view_load_html_fn_t)w->priv->fn_wk_load_html)(webview, w->html, "about:blank");
+	/* Inject queued init scripts at document start */
+	if (w->priv->fn_wk_get_ucm && w->priv->fn_wk_user_script_new && w->priv->fn_wk_ucm_add_script) {
+	    void *ucm2 = ((wk_get_ucm_fn_t)w->priv->fn_wk_get_ucm)(webview);
+	    if (ucm2) {
+	        for (int i_ = 0; i_ < w->priv->init_scripts_count; i_++) {
+	            if (!w->priv->init_scripts[i_]) continue;
+	            void *uscript = ((wk_user_script_new_fn_t)w->priv->fn_wk_user_script_new)(
+	                w->priv->init_scripts[i_], 1, 0, NULL, NULL);
+	            if (uscript) {
+	                ((wk_ucm_add_script_fn_t)w->priv->fn_wk_ucm_add_script)(ucm2, uscript);
+	                if (w->priv->fn_g_object_unref)
+	                    ((g_object_unref_fn_t)w->priv->fn_g_object_unref)(uscript);
+	            }
+	        }
+	    }
+	}
 
-    ((gtk_container_add_fn_t)w->priv->fn_gtk_container_add)(window, webview);
+	if (w->html && w->html[0])
+	    ((webkit_web_view_load_html_fn_t)w->priv->fn_wk_load_html)(webview, w->html, "about:blank");
+
+	((gtk_container_add_fn_t)w->priv->fn_gtk_container_add)(window, webview);
     ((gtk_widget_show_all_fn_t)w->priv->fn_gtk_widget_show_all)(window);
 
+    w->priv->nswindow = window;
     w->priv->native  = window;
     w->priv->running = 1;
     g_active_webview_gtk = w;
@@ -840,6 +1053,8 @@ linux_backend_init(webview_shim_t *w)
 static int
 linux_backend_loop(webview_shim_t *w, int blocking)
 {
+    /* Drain any pending dispatch items first */
+    wv_drain_dispatch(w->priv, w);
     if (blocking) {
         gtk_main_iteration_fn_t gtk_main_iter =
             (gtk_main_iteration_fn_t)w->priv->fn_gtk_main_iteration;
@@ -918,31 +1133,32 @@ typedef size_t              WPARAM;
 typedef size_t              LPARAM;
 
 /* ── Win32 constants ──────────────────────────────────────────────── */
-#define WS_OVERLAPPEDWINDOW  0x00CF0000UL
-#define WS_VISIBLE           0x10000000UL
-#define CW_USEDEFAULT        ((int)0x80000000)
-#define SW_SHOWDEFAULT       10
-#define COLOR_WINDOW         5
-#define PM_NOREMOVE          0
-#define PM_REMOVE            1
-#define WM_CLOSE             0x0010
-#define WM_DESTROY           0x0002
-#define WM_SIZE              0x0005
-#define WM_SETTEXT           0x000C
-#define WM_QUIT              0x0012
+#define WS_OVERLAPPEDWINDOW      0x00CF0000UL
+#define WS_VISIBLE               0x10000000UL
+#define CW_USEDEFAULT            ((int)0x80000000)
+#define SW_SHOWDEFAULT           10
+#define COLOR_WINDOW             5
+#define PM_NOREMOVE              0
+#define PM_REMOVE                1
+#define WM_CLOSE                 0x0010
+#define WM_DESTROY               0x0002
+#define WM_SIZE                  0x0005
+#define WM_SETTEXT               0x000C
+#define WM_QUIT                  0x0012
+#define WM_APP                   0x8000
 #define COINIT_APARTMENTTHREADED 2
-#define S_OK                 0L
-#define E_NOINTERFACE        0x80004002L
-#define E_FAIL               0x80004005L
+#define S_OK                     0L
+#define E_NOINTERFACE            0x80004002L
+#define E_FAIL                   0x80004005L
 
 /* Variant types */
-#define VT_EMPTY             0
-#define VT_BSTR              8
-#define VT_BOOL              11
-#define VT_I4                3
-#define VT_BYREF             0x4000
-#define VARIANT_TRUE         0xFFFF
-#define VARIANT_FALSE        0x0000
+#define VT_EMPTY                 0
+#define VT_BSTR                  8
+#define VT_BOOL                  11
+#define VT_I4                    3
+#define VT_BYREF                 0x4000
+#define VARIANT_TRUE             0xFFFF
+#define VARIANT_FALSE            0x0000
 
 /* ── MSG and RECT structs ─────────────────────────────────────────── */
 typedef struct { int left; int top; int right; int bottom; } RECT;
@@ -1000,20 +1216,20 @@ typedef struct {
 #else
   #define MSABI
 #endif
-typedef MSABI long  (*msabi_hr_t)(void);
-typedef MSABI long  (*msabi_coinit_t)(void*, unsigned long);
-typedef MSABI void  (*msabi_couninit_t)(void);
-typedef MSABI void *(*msabi_cotaskmemfree_t)(void*);
-typedef MSABI long  (*msabi_createenv_t)(const unsigned short*,
-                                          const unsigned short*, void*, void*);
-typedef MSABI int   (*msabi_showw_t)(HWND, int);
-typedef MSABI int   (*msabi_peekw_t)(MSG*, HWND, UINT, UINT, UINT);
-typedef MSABI int   (*msabi_getw_t)(MSG*, HWND, UINT, UINT);
-typedef MSABI int   (*msabi_trans_t)(const MSG*);
+typedef MSABI long      (*msabi_hr_t)(void);
+typedef MSABI long      (*msabi_coinit_t)(void*, unsigned long);
+typedef MSABI void      (*msabi_couninit_t)(void);
+typedef MSABI void *    (*msabi_cotaskmemfree_t)(void*);
+typedef MSABI long      (*msabi_createenv_t)(const unsigned short*,
+                                             const unsigned short*, void*, void*);
+typedef MSABI int       (*msabi_showw_t)(HWND, int);
+typedef MSABI int       (*msabi_peekw_t)(MSG*, HWND, UINT, UINT, UINT);
+typedef MSABI int       (*msabi_getw_t)(MSG*, HWND, UINT, UINT);
+typedef MSABI int       (*msabi_trans_t)(const MSG*);
 typedef MSABI long long (*msabi_disp_t)(const MSG*);
-typedef MSABI int   (*msabi_getclientrect_t)(HWND, RECT*);
-typedef MSABI void  (*msabi_destroyw_t)(HWND);
-typedef MSABI void  (*msabi_postquit_t)(int);
+typedef MSABI int       (*msabi_getclientrect_t)(HWND, RECT*);
+typedef MSABI void      (*msabi_destroyw_t)(HWND);
+typedef MSABI void      (*msabi_postquit_t)(int);
 typedef MSABI long long (*msabi_defwndproc_t)(HWND, UINT, WPARAM, LPARAM);
 
 /* ── Global Windows state (single instance) ──────────────────────── */
@@ -1107,7 +1323,8 @@ static MSABI HRESULT com_QueryInterface(void *self, const void *riid, void **ppv
 static MSABI HRESULT nav_on_starting(void *self, void *sender, void *args)
 {
     (void)self; (void)sender;
-    if (!g_win.w || !g_win.w->on_invoke || !args) return S_OK;
+    if (!g_win.w || !args) return S_OK;
+    if (!g_win.w->on_invoke && (!g_win.w->priv || g_win.w->priv->bindings_count == 0)) return S_OK;
     unsigned short *uri = NULL;
     ((MSABI HRESULT(*)(void*, unsigned short**))VTBL(args, 3))(args, &uri);
     if (!uri) return S_OK;
@@ -1139,7 +1356,7 @@ static MSABI HRESULT nav_on_starting(void *self, void *sender, void *args)
                 *d = 0;
             }
         }
-        g_win.w->on_invoke(g_win.w, decoded ? decoded : pstr);
+        	wv_handle_invoke(g_win.w, decoded ? decoded : pstr);
         free(decoded);
     }
     free(uri8);
@@ -1186,12 +1403,34 @@ static MSABI HRESULT ctrl_on_created(void *self, HRESULT res, void *controller)
        Uses navigation-based protocol (same as macOS backend) — confirmed slot 7. */
     {
         static const char kBootJs[] =
+            "window.__wv_pending={};"
+            "window.__wv_bind_resolve=function(id,ok,r){"
+            "var c=window.__wv_pending[id];if(!c)return;"
+            "try{r=JSON.parse(r)}catch(e){}"
+            "if(ok)c[0](r);else c[1](r);delete window.__wv_pending[id];};"
+            "window.__wv_add_binding=function(n){"
+            "if(window[n]&&window[n].__wv_bound)return;"
+            "window[n]=function(){var i='__wv_'+Date.now()+'_'+Math.random().toString(36).slice(2);"
+            "var a=Array.prototype.slice.call(arguments);"
+            "return new Promise(function(s,f){"
+            "window.__wv_pending[i]=[s,f];"
+            "window.external.invoke(JSON.stringify({__bind__:n,__id__:i,__args__:a}));});};"
+            "window[n].__wv_bound=true;};"
             "window.external={invoke:function(m){"
             "window.location.href='about:blank?__invoke='+encodeURIComponent(m)}};";
         unsigned short *wBoot = utf8_to_wide(kBootJs);
         if (wBoot) {
             ((MSABI HRESULT(*)(void*, const unsigned short*, void*))VTBL(wv, 27))(wv, wBoot, NULL);
             free(wBoot);
+        }
+        /* Inject queued init scripts */
+        for (int i_ = 0; i_ < g_win.w->priv->init_scripts_count; i_++) {
+            if (!g_win.w->priv->init_scripts[i_]) continue;
+            unsigned short *wInit = utf8_to_wide(g_win.w->priv->init_scripts[i_]);
+            if (wInit) {
+                ((MSABI HRESULT(*)(void*, const unsigned short*, void*))VTBL(wv, 27))(wv, wInit, NULL);
+                free(wInit);
+            }
         }
     }
 
@@ -1336,11 +1575,12 @@ windows_backend_init(webview_shim_t *w)
     fnGetW  = (msabi_getw_t)cosmo_dlsym(user32,"GetMessageW");
     fnTrans = (msabi_trans_t)cosmo_dlsym(user32,"TranslateMessage");
     fnDisp  = (msabi_disp_t)cosmo_dlsym(user32,"DispatchMessageW");
-    w->priv->fn_PeekMessageW = (void*)fnPeekW;
-    w->priv->fn_GetMessageW = (void*)fnGetW;
-    w->priv->fn_TranslateMessage = (void*)fnTrans;
-    w->priv->fn_DispatchMessageW = (void*)fnDisp;
-    w->priv->fn_CoUninitialize = (void*)cosmo_dlsym(ole32,"CoUninitialize");
+    	w->priv->fn_PeekMessageW = (void*)fnPeekW;
+    	w->priv->fn_GetMessageW = (void*)fnGetW;
+    	w->priv->fn_TranslateMessage = (void*)fnTrans;
+    	w->priv->fn_DispatchMessageW = (void*)fnDisp;
+    	w->priv->fn_CoUninitialize = (void*)cosmo_dlsym(ole32,"CoUninitialize");
+    	w->priv->fn_PostMessageW = (void*)cosmo_dlsym(user32,"PostMessageW");
     g_win.proc_DefWindowProcW = (msabi_defwndproc_t)cosmo_dlsym(user32,"DefWindowProcW");
     g_win.proc_DestroyWindow  = (msabi_destroyw_t)cosmo_dlsym(user32,"DestroyWindow");
     g_win.proc_PostQuitMessage = (msabi_postquit_t)cosmo_dlsym(user32,"PostQuitMessage");
@@ -1398,6 +1638,7 @@ windows_backend_init(webview_shim_t *w)
 
     w->priv->webview = g_win.webview;
     w->priv->running = 1;
+    w->priv->nswindow = g_win.hwnd;
     w->priv->native  = g_win.hwnd;
     return 0;
 
@@ -1413,7 +1654,8 @@ fail:
 static int
 windows_backend_loop(webview_shim_t *w, int blocking)
 {
-    (void)w;
+    /* Drain any pending dispatch items first */
+    wv_drain_dispatch(w->priv, w);
     msabi_peekw_t fnPeekW = (msabi_peekw_t)w->priv->fn_PeekMessageW;
     msabi_getw_t  fnGetW  = (msabi_getw_t)w->priv->fn_GetMessageW;
     msabi_trans_t fnTrans = (msabi_trans_t)w->priv->fn_TranslateMessage;
@@ -1461,6 +1703,331 @@ windows_backend_exit(webview_shim_t *w)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+   Platform implementations for new API
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── macOS implementations ───────────────────────────────────────── */
+static int
+macos_backend_navigate(webview_shim_t *w, const char *url)
+{
+    webview_shim_priv *p = w->priv;
+    if (!p->objc_lib || !p->webview || !url || !url[0]) return -1;
+    msgSend_id_id_fn msg_id_id = (msgSend_id_id_fn)p->fn_objc_msgSend_id_id;
+    msgSend_void_id_fn msg_void_id = (msgSend_void_id_fn)p->fn_objc_msgSend;
+    sel_registerName_t sr = (sel_registerName_t)p->ms_sel_registerName;
+    objc_getClass_t oc = (objc_getClass_t)p->ms_objc_getClass;
+    if (!msg_id_id || !msg_void_id || !sr || !oc) return -1;
+    void *nsStr = msg_id_id(oc("NSString"), sr("stringWithUTF8String:"), (void*)url);
+    if (!nsStr) return -1;
+    void *nsurl = msg_id_id(oc("NSURL"), sr("URLWithString:"), nsStr);
+    if (!nsurl) return -1;
+    void *req = msg_id_id(oc("NSURLRequest"), sr("requestWithURL:"), nsurl);
+    if (!req) return -1;
+    msg_void_id(p->webview, sr("loadRequest:"), req);
+    return 0;
+}
+
+static int
+macos_backend_set_title(webview_shim_t *w, const char *title)
+{
+    webview_shim_priv *p = w->priv;
+    if (!p->objc_lib || !p->nswindow || !title) return -1;
+    msgSend_id_id_fn msg_id_id = (msgSend_id_id_fn)p->fn_objc_msgSend_id_id;
+    msgSend_void_id_fn msg_void_id = (msgSend_void_id_fn)p->fn_objc_msgSend;
+    sel_registerName_t sr = (sel_registerName_t)p->ms_sel_registerName;
+    objc_getClass_t oc = (objc_getClass_t)p->ms_objc_getClass;
+    if (!msg_id_id || !sr || !oc) return -1;
+    void *nsstr = msg_id_id(oc("NSString"), sr("stringWithUTF8String:"), (void*)title);
+    if (!nsstr) return -1;
+    msg_void_id(p->nswindow, sr("setTitle:"), nsstr);
+    return 0;
+}
+
+static int
+macos_backend_set_size(webview_shim_t *w, int width, int height, int hints)
+{
+    webview_shim_priv *p = w->priv;
+    if (!p->objc_lib || !p->nswindow) return -1;
+    msgSend_void_fn msg_v = (msgSend_void_fn)p->fn_objc_msgSend;
+    msgSend_id_fn msg_id = (msgSend_id_fn)p->fn_objc_msgSend_id;
+    sel_registerName_t sr = (sel_registerName_t)p->ms_sel_registerName;
+    objc_getClass_t oc = (objc_getClass_t)p->ms_objc_getClass;
+    if (!msg_v || !msg_id || !sr || !oc) return -1;
+
+    if (hints == 3) {
+        /* FIXED: remove resizable style mask bit */
+        unsigned long style = (unsigned long)(size_t)msg_id(p->nswindow, sr("styleMask"));
+        style &= ~(1UL<<3); /* NSResizableWindowMask */
+        msg_v(p->nswindow, sr("setStyleMask:"), (void*)(size_t)style);
+        return 0;
+    }
+    if (hints == 2) {
+        /* MAX: set max size via setFrame: */
+        typedef void (*msg_v_dddd_fn)(void*, void*, double, double, double, double, int);
+        msg_v_dddd_fn msg_v4d = (msg_v_dddd_fn)p->fn_objc_msgSend;
+        msg_v4d(p->nswindow, sr("setFrame:display:animate:"),
+            0, 0, (double)width, (double)height, 1);
+        return 0;
+    }
+    if (hints == 1) {
+        /* MIN: set min size via setContentSize: for now */
+        typedef void (*msg_v_dd_fn)(void*, void*, double, double);
+        msg_v_dd_fn msg_vdd = (msg_v_dd_fn)p->fn_objc_msgSend;
+        msg_vdd(p->nswindow, sr("setContentSize:"), (double)width, (double)height);
+        return 0;
+    }
+    /* NONE: set content size (pass NSSize as two doubles via msgSend) */
+    {
+        typedef void (*msg_v_dd_fn)(void*, void*, double, double);
+        msg_v_dd_fn msg_vdd = (msg_v_dd_fn)p->fn_objc_msgSend;
+        msg_vdd(p->nswindow, sr("setContentSize:"), (double)width, (double)height);
+    }
+    return 0;
+}
+
+static int
+macos_backend_set_html(webview_shim_t *w, const char *html)
+{
+    webview_shim_priv *p = w->priv;
+    if (!p->objc_lib || !p->webview || !html) return -1;
+    msgSend_id_id_fn msg_id_id = (msgSend_id_id_fn)p->fn_objc_msgSend_id_id;
+    sel_registerName_t sr = (sel_registerName_t)p->ms_sel_registerName;
+    objc_getClass_t oc = (objc_getClass_t)p->ms_objc_getClass;
+    if (!msg_id_id || !sr || !oc) return -1;
+    void *nsstr = msg_id_id(oc("NSString"), sr("stringWithUTF8String:"), (void*)html);
+    void *baseURL = msg_id_id(oc("NSURL"), sr("URLWithString:"),
+        msg_id_id(oc("NSString"), sr("stringWithUTF8String:"), "about:blank"));
+    typedef void (*msg_3id_fn)(void*, void*, void*, void*);
+    ((msg_3id_fn)p->fn_objc_msgSend)(p->webview, sr("loadHTMLString:baseURL:"), nsstr, baseURL);
+    return 0;
+}
+
+static int
+macos_backend_set_fullscreen(webview_shim_t *w, int fullscreen)
+{
+    webview_shim_priv *p = w->priv;
+    if (!p->objc_lib || !p->nswindow) return -1;
+    msgSend_void_fn msg_v = (msgSend_void_fn)p->fn_objc_msgSend;
+    sel_registerName_t sr = (sel_registerName_t)p->ms_sel_registerName;
+    if (!msg_v || !sr) return -1;
+    msg_v(p->nswindow, sr("toggleFullScreen:"), NULL);
+    return 0;
+}
+
+static int
+macos_backend_init_script(webview_shim_t *w, const char *js)
+{
+    webview_shim_priv *p = w->priv;
+    if (!p->objc_lib || !p->webview || !js || !js[0]) return -1;
+    msgSend_id_id_fn msg_id_id = (msgSend_id_id_fn)p->fn_objc_msgSend_id_id;
+    msgSend_void_id_fn msg_void_id = (msgSend_void_id_fn)p->fn_objc_msgSend;
+    msgSend_id_fn msg_id = (msgSend_id_fn)p->fn_objc_msgSend_id;
+    sel_registerName_t sr = (sel_registerName_t)p->ms_sel_registerName;
+    objc_getClass_t oc = (objc_getClass_t)p->ms_objc_getClass;
+    if (!msg_id_id || !msg_void_id || !msg_id || !sr || !oc) return -1;
+
+    	void *jsStr = msg_id_id(oc("NSString"), sr("stringWithUTF8String:"), (void*)js);
+
+    	/* Inject as WKUserScript (applies to future page loads) */
+    	void *usCls = oc("WKUserScript");
+    	void *uscript = msg_id(msg_id(usCls, sr("alloc")),
+    	    sr("initWithSource:injectionTime:forMainFrameOnly:"), jsStr, 0, 1);
+    	if (uscript) {
+    	    msgSend_id_fn msg_id_v = (msgSend_id_fn)p->fn_objc_msgSend_id;
+    	    void *config = msg_id_v(
+    	        msg_id_v(p->webview, sr("configuration")),
+    	        sr("userContentController"));
+    	    if (config) {
+    	        msg_void_id(config, sr("addUserScript:"), uscript);
+    	    }
+    	}
+
+    	/* Also evaluate now (applies to current page) */
+    	{
+    	    void* (*msg_eval_t)(void*, void*, void*, void*) =
+    	        (void* (*)(void*,void*,void*,void*))p->fn_objc_msgSend;
+    	    msg_eval_t(p->webview,
+    	        sr("evaluateJavaScript:completionHandler:"),
+    	        jsStr, NULL);
+    	}
+    	return 0;
+}
+
+/* ── Linux implementations ───────────────────────────────────────── */
+static int
+linux_backend_navigate(webview_shim_t *w, const char *url)
+{
+    webview_shim_priv *p = w->priv;
+    if (!p->fn_wk_load_uri || !p->webview || !url || !url[0]) return -1;
+    typedef void (*wk_load_uri_fn_t)(void*, const char*);
+    ((wk_load_uri_fn_t)p->fn_wk_load_uri)(p->webview, url);
+    return 0;
+}
+
+static int
+linux_backend_set_title(webview_shim_t *w, const char *title)
+{
+    webview_shim_priv *p = w->priv;
+    if (!p->fn_gtk_window_set_title || !p->nswindow || !title) return -1;
+    ((gtk_window_set_title_fn_t)p->fn_gtk_window_set_title)(p->nswindow, title);
+    return 0;
+}
+
+static int
+linux_backend_set_size(webview_shim_t *w, int width, int height, int hints)
+{
+    webview_shim_priv *p = w->priv;
+    if (!p->nswindow) return -1;
+    if (hints == 3) {
+        if (!p->fn_gtk_window_set_resizable) return -1;
+        ((gtk_window_set_resizable_fn_t)p->fn_gtk_window_set_resizable)(p->nswindow, 0);
+        return 0;
+    }
+    if (!p->fn_gtk_window_set_default_size) return -1;
+    ((gtk_window_set_default_size_fn_t)p->fn_gtk_window_set_default_size)(p->nswindow, width, height);
+    return 0;
+}
+
+static int
+linux_backend_set_html(webview_shim_t *w, const char *html)
+{
+    webview_shim_priv *p = w->priv;
+    if (!p->fn_wk_load_html || !p->webview || !html) return -1;
+    ((webkit_web_view_load_html_fn_t)p->fn_wk_load_html)(p->webview, html, "about:blank");
+    return 0;
+}
+
+static int
+linux_backend_set_fullscreen(webview_shim_t *w, int fullscreen)
+{
+    webview_shim_priv *p = w->priv;
+    if (!p->nswindow) return -1;
+    typedef void (*fs_fn_t)(void*);
+    if (fullscreen) {
+        fs_fn_t fs = (fs_fn_t)cosmo_dlsym(p->gtk_lib, "gtk_window_fullscreen");
+        if (fs) { fs(p->nswindow); return 0; }
+    } else {
+        fs_fn_t uf = (fs_fn_t)cosmo_dlsym(p->gtk_lib, "gtk_window_unfullscreen");
+        if (uf) { uf(p->nswindow); return 0; }
+    }
+    return -1;
+}
+
+static int
+linux_backend_init_script(webview_shim_t *w, const char *js)
+{
+    webview_shim_priv *p = w->priv;
+    if (!p->fn_wk_user_script_new || !p->fn_wk_ucm_add_script || !p->fn_wk_get_ucm
+        || !p->webview || !js || !js[0]) return -1;
+    void *ucm = ((wk_get_ucm_fn_t)p->fn_wk_get_ucm)(p->webview);
+    if (!ucm) return -1;
+    void *script = ((wk_user_script_new_fn_t)p->fn_wk_user_script_new)(js, 1, 0, NULL, NULL);
+    if (!script) return -1;
+    ((wk_ucm_add_script_fn_t)p->fn_wk_ucm_add_script)(ucm, script);
+    if (p->fn_g_object_unref)
+        ((g_object_unref_fn_t)p->fn_g_object_unref)(script);
+    return 0;
+}
+
+/* ── Windows implementations ─────────────────────────────────────── */
+static int
+windows_backend_navigate(webview_shim_t *w, const char *url)
+{
+    webview_shim_priv *p = w->priv;
+    if (!g_win.webview || !url || !url[0]) return -1;
+    unsigned short *wurl = utf8_to_wide(url);
+    if (!wurl) return -1;
+    /* ICoreWebView2::Navigate — vtable slot 5 */
+    ((MSABI HRESULT(*)(void*, const unsigned short*))VTBL(g_win.webview, 5))(g_win.webview, wurl);
+    free(wurl);
+    return 0;
+}
+
+static int
+windows_backend_set_title(webview_shim_t *w, const char *title)
+{
+    webview_shim_priv *p = w->priv;
+    if (!g_win.h_user32 || !p->nswindow || !title) return -1;
+    typedef MSABI long (*sendw_t)(HWND, UINT, WPARAM, LPARAM);
+    sendw_t fnSendW = (sendw_t)cosmo_dlsym(g_win.h_user32, "SendMessageW");
+    if (!fnSendW) return -1;
+    unsigned short *wtitle = utf8_to_wide(title);
+    if (!wtitle) return -1;
+    fnSendW((HWND)p->nswindow, WM_SETTEXT, 0, (LPARAM)(size_t)wtitle);
+    free(wtitle);
+    return 0;
+}
+
+static int
+windows_backend_set_size(webview_shim_t *w, int width, int height, int hints)
+{
+    webview_shim_priv *p = w->priv;
+    if (!g_win.h_user32 || !p->nswindow) return -1;
+    typedef MSABI int (*setwindowpos_t)(HWND, HWND, int, int, int, int, UINT);
+    setwindowpos_t fnSWP = (setwindowpos_t)cosmo_dlsym(g_win.h_user32, "SetWindowPos");
+    if (!fnSWP) return -1;
+    fnSWP((HWND)p->nswindow, NULL, 0, 0, width, height,
+          0x0002 | 0x0004); /* SWP_NOMOVE | SWP_NOZORDER */
+    return 0;
+}
+
+static int
+windows_backend_set_html(webview_shim_t *w, const char *html)
+{
+    webview_shim_priv *p = w->priv;
+    if (!g_win.webview || !html) return -1;
+    unsigned short *wh = utf8_to_wide(html);
+    if (!wh) return -1;
+    /* ICoreWebView2::NavigateToString — slot 6 */
+    ((MSABI HRESULT(*)(void*, const unsigned short*))VTBL(g_win.webview, 6))(g_win.webview, wh);
+    free(wh);
+    return 0;
+}
+
+static int
+windows_backend_set_fullscreen(webview_shim_t *w, int fullscreen)
+{
+    webview_shim_priv *p = w->priv;
+    if (!g_win.h_user32 || !p->nswindow) return -1;
+    typedef MSABI long (*sendw_t)(HWND, UINT, WPARAM, LPARAM);
+    sendw_t fnSendW = (sendw_t)cosmo_dlsym(g_win.h_user32, "SendMessageW");
+    if (!fnSendW) return -1;
+    fnSendW((HWND)p->nswindow, 0x0112, fullscreen ? 0xF030 : 0xF120, 0);
+    /* WM_SYSCOMMAND, SC_MAXIMIZE / SC_RESTORE */
+    return 0;
+}
+
+static int
+windows_backend_init_script(webview_shim_t *w, const char *js)
+{
+    webview_shim_priv *p = w->priv;
+    if (!g_win.webview || !js || !js[0]) return -1;
+    unsigned short *wjs = utf8_to_wide(js);
+    if (!wjs) return -1;
+    /* ExecuteScript — slot 27 (or AddScriptToExecuteOnDocumentCreated via slot 13) */
+    ((MSABI HRESULT(*)(void*, const unsigned short*, void*))VTBL(g_win.webview, 27))(g_win.webview, wjs, NULL);
+    free(wjs);
+    return 0;
+}
+
+/* ── Helper: register a named binding function ──────────────────── */
+static int
+wv_inject_bind_js(webview_shim_t *w, const char *name)
+{
+    if (!w || !w->priv || !name) return -1;
+    /* Use the bootstrap's __wv_add_binding helper to create window[name] */
+    char js[256];
+    int n = snprintf(js, sizeof(js),
+        "window.__wv_add_binding('%s');", name);
+    if (n <= 0 || n >= (int)sizeof(js)) return -1;
+    /* Eval immediately — evaluateJavaScript queues if page hasn't loaded */
+    webview_shim_eval(w, js);
+    /* Also register as init script so it persists across page reloads */
+    webview_shim_init_script(w, js);
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
    Public API
    ═══════════════════════════════════════════════════════════════════════ */
 
@@ -1497,6 +2064,229 @@ webview_shim_init(webview_shim_t *w)
 int webview_shim_loop(webview_shim_t *w, int blocking) { if (!w || !w->priv) return 1; return w->priv->loop(w, blocking); }
 void webview_shim_eval(webview_shim_t *w, const char *js) { if (!w || !w->priv || !js) return; w->priv->eval(w, js); }
 void webview_shim_exit(webview_shim_t *w) { if (!w || !w->priv) return; w->priv->exit(w); if (w->priv->objc_lib) { cosmo_dlclose(w->priv->objc_lib); w->priv->objc_lib = NULL; } if (w->priv->handle) cosmo_dlclose(w->priv->handle); free(w->priv); w->priv = NULL; }
+
+/* ── New public API ───────────────────────────────────────────────── */
+
+int
+webview_shim_navigate(webview_shim_t *w, const char *url)
+{
+    if (!w || !w->priv || !url || !url[0]) return -1;
+    switch (w->priv->platform) {
+    case 0: return macos_backend_navigate(w, url);
+    case 1: return linux_backend_navigate(w, url);
+    case 2: return windows_backend_navigate(w, url);
+    default: return -1;
+    }
+}
+
+void
+webview_shim_dispatch(webview_shim_t *w,
+                      void (*fn)(struct webview_shim *w, void *arg),
+                      void *arg)
+{
+    if (!w || !w->priv || !fn) return;
+    webview_shim_priv *p = w->priv;
+    wv_dispatch_item_t *item = (wv_dispatch_item_t *)malloc(sizeof(*item));
+    if (!item) return;
+    item->fn = (void (*)(webview_shim_t*, void*))fn;
+    item->arg = arg;
+    item->next = NULL;
+    wv_lock(&p->dispatch_lock);
+    if (p->dispatch_tail) {
+        p->dispatch_tail->next = item;
+        p->dispatch_tail = item;
+    } else {
+        p->dispatch_head = item;
+        p->dispatch_tail = item;
+    }
+    wv_unlock(&p->dispatch_lock);
+
+    /* Wake the event loop on Linux and Windows */
+    switch (p->platform) {
+    case 0: /* macOS: loop wakes every 50ms */ break;
+    case 1: /* Linux */
+        if (p->gtk_lib) {
+            void (*wake)(void*) = (void (*)(void*))cosmo_dlsym(
+                p->gtk_lib, "g_main_context_wakeup");
+            if (wake) wake(NULL);
+        }
+        break;
+    case 2: /* Windows */
+        if (p->fn_PostMessageW && p->nswindow) {
+            ((MSABI int (*)(HWND, UINT, WPARAM, LPARAM))p->fn_PostMessageW)(
+                (HWND)p->nswindow, WM_APP, 0, 0);
+        }
+        break;
+    }
+}
+
+int
+webview_shim_set_title(webview_shim_t *w, const char *title)
+{
+    if (!w || !w->priv || !title) return -1;
+    switch (w->priv->platform) {
+    case 0: return macos_backend_set_title(w, title);
+    case 1: return linux_backend_set_title(w, title);
+    case 2: return windows_backend_set_title(w, title);
+    default: return -1;
+    }
+}
+
+int
+webview_shim_set_size(webview_shim_t *w, int width, int height, int hints)
+{
+    if (!w || !w->priv) return -1;
+    switch (w->priv->platform) {
+    case 0: return macos_backend_set_size(w, width, height, hints);
+    case 1: return linux_backend_set_size(w, width, height, hints);
+    case 2: return windows_backend_set_size(w, width, height, hints);
+    default: return -1;
+    }
+}
+
+int
+webview_shim_bind(webview_shim_t *w, const char *name,
+                  webview_shim_bind_fn fn, void *arg)
+{
+    if (!w || !w->priv || !name || !name[0] || !fn) return -1;
+    webview_shim_priv *p = w->priv;
+    if (p->bindings_count >= WV_MAX_BINDINGS) return -1;
+
+    /* Check for duplicate */
+    for (int i = 0; i < p->bindings_count; i++) {
+        if (strcmp(p->bindings[i].name, name) == 0) {
+            p->bindings[i].fn = fn;
+            p->bindings[i].arg = arg;
+            return 0;
+        }
+    }
+
+    int idx = p->bindings_count++;
+    size_t nlen = strlen(name);
+    if (nlen >= sizeof(p->bindings[idx].name)) nlen = sizeof(p->bindings[idx].name) - 1;
+    memcpy(p->bindings[idx].name, name, nlen);
+    p->bindings[idx].name[nlen] = 0;
+    p->bindings[idx].fn = fn;
+    p->bindings[idx].arg = arg;
+
+    /* Inject JS stub for this binding */
+    return wv_inject_bind_js(w, name);
+}
+
+int
+webview_shim_unbind(webview_shim_t *w, const char *name)
+{
+    if (!w || !w->priv || !name || !name[0]) return -1;
+    webview_shim_priv *p = w->priv;
+    for (int i = 0; i < p->bindings_count; i++) {
+        if (strcmp(p->bindings[i].name, name) == 0) {
+            /* Remove by shifting */
+            p->bindings_count--;
+            if (i < p->bindings_count) {
+                memmove(&p->bindings[i], &p->bindings[i+1],
+                        sizeof(wv_binding_t) * (p->bindings_count - i));
+            }
+            /* Eval JS to delete the window function */
+            char js[256];
+            snprintf(js, sizeof(js), "delete window['%s'];", name);
+            webview_shim_eval(w, js);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+void
+webview_shim_return(webview_shim_t *w, const char *id,
+                    int success, const char *result)
+{
+    if (!w || !w->priv || !id || !result) return;
+    /* Escape result for embedding in a JS string literal. The result is
+       expected to be valid JSON. We escape backslashes, quotes, and
+       control characters, then wrap in JSON.parse() so the JS side gets
+       the exact JSON value (string, number, object, etc.). */
+    char buf[4096];
+    char *d = buf;
+    const char *s = result;
+    while (*s && (size_t)(d - buf) < sizeof(buf) - 4) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '\\')       { *d++ = '\\'; *d++ = '\\'; }
+        else if (c == '\'')  { *d++ = '\\'; *d++ = '\''; }
+        else if (c == '\n')  { *d++ = '\\'; *d++ = 'n'; }
+        else if (c == '\r')  { *d++ = '\\'; *d++ = 'r'; }
+        else if (c == '\t')  { *d++ = '\\'; *d++ = 't'; }
+        else if (c < 0x20)   { *d++ = '\\'; *d++ = 'x'; /* skip control chars */ }
+        else                  { *d++ = c; }
+        s++;
+    }
+    *d = 0;
+
+    char js[4096];
+    int n = snprintf(js, sizeof(js),
+        "window.__wv_bind_resolve('%s',%d,JSON.parse('%s'));",
+        id, success ? 1 : 0, buf);
+    if (n > 0 && n < (int)sizeof(js))
+        webview_shim_eval(w, js);
+}
+
+int
+webview_shim_init_script(webview_shim_t *w, const char *js)
+{
+    if (!w || !w->priv || !js || !js[0]) return -1;
+    webview_shim_priv *p = w->priv;
+
+    /* Store the init script */
+    if (p->init_scripts_count >= WV_MAX_INIT_SCRIPTS) return -1;
+    int idx = p->init_scripts_count++;
+    p->init_scripts[idx] = strdup(js);
+    if (!p->init_scripts[idx]) return -1;
+
+    /* If webview already initialized, inject now */
+    if (p->webview && p->running) {
+        switch (p->platform) {
+        case 0: return macos_backend_init_script(w, js);
+        case 1: return linux_backend_init_script(w, js);
+        case 2: return windows_backend_init_script(w, js);
+        }
+    }
+    return 0;
+}
+
+int
+webview_shim_set_html(webview_shim_t *w, const char *html)
+{
+    if (!w || !w->priv || !html) return -1;
+    switch (w->priv->platform) {
+    case 0: return macos_backend_set_html(w, html);
+    case 1: return linux_backend_set_html(w, html);
+    case 2: return windows_backend_set_html(w, html);
+    default: return -1;
+    }
+}
+
+int
+webview_shim_set_fullscreen(webview_shim_t *w, int fullscreen)
+{
+    if (!w || !w->priv) return -1;
+    switch (w->priv->platform) {
+    case 0: return macos_backend_set_fullscreen(w, fullscreen);
+    case 1: return linux_backend_set_fullscreen(w, fullscreen);
+    case 2: return windows_backend_set_fullscreen(w, fullscreen);
+    default: return -1;
+    }
+}
+
+void
+webview_shim_terminate(webview_shim_t *w)
+{
+    if (!w || !w->priv) return;
+    w->priv->running = 0;
+    /* Wake event loop on Windows */
+    if (w->priv->platform == 2 && w->priv->fn_PostMessageW && w->priv->nswindow) {
+        ((MSABI int (*)(HWND, UINT, WPARAM, LPARAM))w->priv->fn_PostMessageW)(
+            (HWND)w->priv->nswindow, WM_QUIT, 0, 0);
+    }
+}
 
 static int  backend_init(webview_shim_t *w) { return w->priv->init(w); }
 static int  backend_loop(webview_shim_t *w, int b) { return w->priv->loop(w, b); }
