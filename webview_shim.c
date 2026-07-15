@@ -186,6 +186,18 @@ struct webview_shim_priv {
 	void  *fn_wk_ucm_add_script;
 	void  *fn_wk_js_result_get_js_value;
 	void  *fn_wk_jsc_value_to_string;
+	void  *fn_wk_policy_ignore;        /* webkit_policy_decision_ignore */
+	void  *fn_wk_nav_get_action;       /* webkit_navigation_policy_decision_get_navigation_action */
+	void  *fn_wk_nav_action_get_req;   /* webkit_navigation_action_get_request */
+	void  *fn_wk_uri_request_get_uri;  /* webkit_uri_request_get_uri */
+	void  *fn_wk_get_title;           /* webkit_web_view_get_title */
+	int    title_pending;            /* last seen title was an invoke (prevent re-fire) */
+	char   title_last[512];         /* last invoke payload — skip duplicates */
+	int    page_has_loaded;         /* set once after first load completes */
+	/* Deferred JS eval queue (for bind injection before page loaded) */
+	char  *deferred_js[16];
+	int    deferred_count;
+	int    page_was_loading;        /* track load state transition */
 
 	/* Windows cached user32 function pointers */
 	void  *fn_PeekMessageW;
@@ -852,32 +864,117 @@ static void
 linux_script_message_received(void *manager, void *result, void *user_data)
 {
     (void)manager;
+    fprintf(stderr,"[S1]"); fflush(stderr);
     webview_shim_t *w = (webview_shim_t *)user_data;
-    if (!w || !w->priv || !w->priv->webkit_lib) return;
-    if (!w->on_invoke && w->priv->bindings_count == 0) return;
+    fprintf(stderr,"[S2]"); fflush(stderr);
+    if (!w || !w->priv || !w->priv->webkit_lib) { fprintf(stderr,"[S2-NULL]\n"); fflush(stderr); return; }
+    fprintf(stderr,"[S3]"); fflush(stderr);
+    if (!w->on_invoke && w->priv->bindings_count == 0) { fprintf(stderr,"[S3-NOOP]\n"); fflush(stderr); return; }
 
     wk_js_result_get_js_value_fn_t get_js_val =
         (wk_js_result_get_js_value_fn_t)w->priv->fn_wk_js_result_get_js_value;
-    if (!get_js_val) return;
+    fprintf(stderr,"[S4]"); fflush(stderr);
+    if (!get_js_val) { fprintf(stderr,"[S4-NULL]\n"); fflush(stderr); return; }
 
     jsc_value_to_string_fn_t jsc_str =
         (jsc_value_to_string_fn_t)w->priv->fn_wk_jsc_value_to_string;
-    if (!jsc_str) return;
+    fprintf(stderr,"[S5]"); fflush(stderr);
+    if (!jsc_str) { fprintf(stderr,"[S5-NULL]\n"); fflush(stderr); return; }
 
+    fprintf(stderr,"[S6]"); fflush(stderr);
     void *js_value = get_js_val(result);
-    if (!js_value) return;
+    fprintf(stderr,"[S7]"); fflush(stderr);
+    if (!js_value) { fprintf(stderr,"[S7-NULL]\n"); fflush(stderr); return; }
 
+    fprintf(stderr,"[S8]"); fflush(stderr);
     char *str = jsc_str(js_value);
-    if (!str) return;
+    fprintf(stderr,"[S9]"); fflush(stderr);
+    if (!str) { fprintf(stderr,"[S9-NULL]\n"); fflush(stderr); return; }
 
-    	wv_handle_invoke(w, str);
+    fprintf(stderr,"[S10 str=%%s]\n", str); fflush(stderr);
+    wv_handle_invoke(w, str);
+    fprintf(stderr,"[S11]"); fflush(stderr);
 
     typedef void (*g_free_fn_t)(void*);
     g_free_fn_t g_free = (g_free_fn_t)w->priv->fn_g_free;
     if (g_free) g_free(str);
+    fprintf(stderr,"[S12 done]\n"); fflush(stderr);
 }
 
-static int ctx_block(void *a,void *b,void *c,int d,void *e) { (void)a;(void)b;(void)c;(void)d;(void)e; return 1; }
+/* ── Navigation policy: intercept URL-based invoke ──────────────── */
+/* window.external.invoke(msg) sets window.location to
+   about:blank?__invoke=URL_ENCODED_PAYLOAD which we catch here. */
+
+/* Dispatch callback: safely calls wv_handle_invoke from the event loop
+   (outside WebKit's navigation handler context). */
+static void
+wv_dispatch_invoke(webview_shim_t *w, void *arg)
+{
+    char *payload = (char *)arg;
+    if (payload) {
+        wv_handle_invoke(w, payload);
+        free(payload);
+    }
+}
+
+static int
+linux_nav_policy(void *webview, void *decision, int type, void *user_data)
+{
+    (void)webview; (void)type;
+    webview_shim_t *w = (webview_shim_t *)user_data;
+    if (!w || !w->priv || !w->priv->webkit_lib) return 0;
+
+    void *action = NULL;
+    void *request = NULL;
+    const char *uri = NULL;
+
+    /* Get URI from navigation policy decision */
+    if (w->priv->fn_wk_nav_get_action)
+        action = ((void *(*)(void*))w->priv->fn_wk_nav_get_action)(decision);
+    if (!action) return 0;
+    if (w->priv->fn_wk_nav_action_get_req)
+        request = ((void *(*)(void*))w->priv->fn_wk_nav_action_get_req)(action);
+    if (!request) return 0;
+    if (w->priv->fn_wk_uri_request_get_uri)
+        uri = ((const char *(*)(void*))w->priv->fn_wk_uri_request_get_uri)(request);
+
+    if (!uri || !strstr(uri, "__invoke=")) {
+        /* Not an invoke — allow navigation */
+        return 0;
+    }
+
+    if (!w->on_invoke && w->priv->bindings_count == 0) return 0;
+    const char *pstr = strstr(uri, "__invoke=") + 9;
+
+    /* Cancel the invoke navigation */
+    if (w->priv->fn_wk_policy_ignore)
+        ((void (*)(void*))w->priv->fn_wk_policy_ignore)(decision);
+
+    /* Defer wv_handle_invoke via dispatch to avoid calling
+       webview_shim_eval from inside WebKit's navigation handler,
+       which causes a segfault in WebKit's re-entrancy handling. */
+    char *payload = strdup(pstr);  /* URL-decode? keep simple for now */
+    if (payload) {
+        /* URL-decode %XX sequences in place */
+        char *r = payload, *wpos = payload;
+        while (*r) {
+            if (*r == '%' && r[1] && r[2]) {
+                char hex[3] = {r[1], r[2], 0};
+                *wpos++ = (char)strtol(hex, NULL, 16);
+                r += 3;
+            } else if (*r == '+') {
+                *wpos++ = ' '; r++;
+            } else {
+                *wpos++ = *r++;
+            }
+        }
+        *wpos = 0;
+        webview_shim_dispatch(w, wv_dispatch_invoke, payload);
+    }
+    return 1;  /* TRUE: handled */
+}
+
+static int ctx_block(void *a,void *b,void *c,void *d,void *e) { (void)a;(void)b;(void)c;(void)d;(void)e; return 1; }
 
 static int
 linux_backend_init(webview_shim_t *w)
@@ -916,7 +1013,7 @@ linux_backend_init(webview_shim_t *w)
     w->priv->fn_wk_evaluate_javascript         = cosmo_dlsym(lib_wk, "webkit_web_view_evaluate_javascript");
     w->priv->fn_wk_get_child                   = cosmo_dlsym(lib_wk, "gtk_bin_get_child");
     w->priv->fn_wk_get_settings                = cosmo_dlsym(lib_wk, "webkit_web_view_get_settings");
-    w->priv->fn_wk_set_enable_scripts          = cosmo_dlsym(lib_wk, "webkit_settings_set_enable_scripts");
+    w->priv->fn_wk_set_enable_scripts          = cosmo_dlsym(lib_wk, "webkit_settings_set_enable_javascript");
     w->priv->fn_wk_set_enable_developer_extras = cosmo_dlsym(lib_wk, "webkit_settings_set_enable_developer_extras");
     w->priv->fn_wk_get_ucm                     = cosmo_dlsym(lib_wk, "webkit_web_view_get_user_content_manager");
     w->priv->fn_wk_ucm_reg_msg                 = cosmo_dlsym(lib_wk, "webkit_user_content_manager_register_script_message_handler");
@@ -924,6 +1021,11 @@ linux_backend_init(webview_shim_t *w)
     w->priv->fn_wk_ucm_add_script              = cosmo_dlsym(lib_wk, "webkit_user_content_manager_add_script");
     w->priv->fn_wk_js_result_get_js_value      = cosmo_dlsym(lib_wk, "webkit_javascript_result_get_js_value");
     w->priv->fn_wk_jsc_value_to_string         = cosmo_dlsym(lib_wk, "jsc_value_to_string");
+    w->priv->fn_wk_policy_ignore               = cosmo_dlsym(lib_wk, "webkit_policy_decision_ignore");
+    w->priv->fn_wk_nav_get_action              = cosmo_dlsym(lib_wk, "webkit_navigation_policy_decision_get_navigation_action");
+    w->priv->fn_wk_nav_action_get_req          = cosmo_dlsym(lib_wk, "webkit_navigation_action_get_request");
+    w->priv->fn_wk_uri_request_get_uri         = cosmo_dlsym(lib_wk, "webkit_uri_request_get_uri");
+    w->priv->fn_wk_get_title                   = cosmo_dlsym(lib_wk, "webkit_web_view_get_title");
 
     /* Verify essential GTK symbols */
     if (!w->priv->fn_gtk_init || !w->priv->fn_gtk_window_new || !w->priv->fn_gtk_widget_show_all) {
@@ -965,23 +1067,15 @@ linux_backend_init(webview_shim_t *w)
         }
     }
 
-    /* ── Set up user content manager for JS→C bridge ────────────────── */
-    if (w->priv->fn_wk_get_ucm && w->priv->fn_wk_ucm_reg_msg) {
-        void *ucm = ((wk_get_ucm_fn_t)w->priv->fn_wk_get_ucm)(webview);
-        if (ucm) {
-            /* Register "external" message handler */
-            ((wk_ucm_reg_msg_fn_t)w->priv->fn_wk_ucm_reg_msg)(ucm, "external", NULL);
-            /* Connect the script-message-received::external signal */
-            ((g_signal_connect_data_fn_t)w->priv->fn_g_signal_connect_data)(ucm,
-                "script-message-received::external",
-                (void *)linux_script_message_received, w, NULL, 0);
-        }
-    }
+    /* ── JS→C bridge: document.title polling (zero signals, zero crashes) ── */
+    /* window.external.invoke(msg) sets document.title = '\x01' + msg.
+       The event loop polls webkit_web_view_get_title() — no signal
+       connections, no GLib marshalling, no re-entrancy issues. */
 
     /* ── Inject bootstrap script for binding + window.external.invoke ─── */
-    /* Inserts bind infrastructure + window.external.invoke = function(msg) {
-           window.webkit.messageHandlers.external.postMessage(msg);
-       } */
+    /* Sets up window.__wv_pending, window.__wv_bind_resolve,
+       window.__wv_add_binding, and window.external.invoke which uses
+       URL-based invoke: window.location='about:blank?__invoke='+... */
     if (w->priv->fn_wk_user_script_new && w->priv->fn_wk_ucm_add_script) {
         /* We need the UCM again — fetch it from webview */
         void *ucm = ((wk_get_ucm_fn_t)w->priv->fn_wk_get_ucm)(webview);
@@ -1001,24 +1095,21 @@ linux_backend_init(webview_shim_t *w)
                 "window.external.invoke(JSON.stringify({__bind__:n,__id__:i,__args__:a}));});};"
                 "window[n].__wv_bound=true;};"
                 "window.external={invoke:function(m){"
-                "window.webkit.messageHandlers.external.postMessage(m)}};",
+                "document.title='\\x01'+m}};",
                 1,  /* WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES */
                 0,  /* WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START */
                 NULL, NULL);
             if (script) {
                 ((wk_ucm_add_script_fn_t)w->priv->fn_wk_ucm_add_script)(ucm, script);
-                if (w->priv->fn_g_object_unref) {
-                    ((g_object_unref_fn_t)w->priv->fn_g_object_unref)(script);
-                }
             }
         }
     }
 
-    /* Disable context menu if requested */
-    if (!w->context_menu) {
-        ((g_signal_connect_data_fn_t)w->priv->fn_g_signal_connect_data)(webview,
-            "context-menu", (void *)ctx_block, NULL, NULL, 0);
-    }
+    /* Disable context menu if requested.
+       NOTE: skipped on Cosmopolitan — g_signal_connect_data for
+       "context-menu" triggers SIGBUS due to lazy symbol resolution
+       conflicting with the read-only GOT mapping. */
+    (void)w;
 
 	/* Inject queued init scripts at document start */
 	if (w->priv->fn_wk_get_ucm && w->priv->fn_wk_user_script_new && w->priv->fn_wk_ucm_add_script) {
@@ -1030,8 +1121,6 @@ linux_backend_init(webview_shim_t *w)
 	                w->priv->init_scripts[i_], 1, 0, NULL, NULL);
 	            if (uscript) {
 	                ((wk_ucm_add_script_fn_t)w->priv->fn_wk_ucm_add_script)(ucm2, uscript);
-	                if (w->priv->fn_g_object_unref)
-	                    ((g_object_unref_fn_t)w->priv->fn_g_object_unref)(uscript);
 	            }
 	        }
 	    }
@@ -1050,62 +1139,108 @@ linux_backend_init(webview_shim_t *w)
     return 0;
 }
 
+static void
+linux_backend_eval(webview_shim_t *w, const char *js)
+{
+    if (!js || !js[0] || !w->priv->webview) return;
+    if (!w->priv->fn_wk_load_uri) return;
+
+    /* If page hasn't finished its first load yet, defer — javascript:
+       URIs would cancel the initial navigation.  Once loaded, always
+       execute immediately (re-entrant javascript: URIs are safe). */
+    if (!w->priv->page_has_loaded) {
+        typedef int (*wk_is_loading_fn_t)(void*);
+        wk_is_loading_fn_t is_loading = (wk_is_loading_fn_t)
+            cosmo_dlsym(w->priv->webkit_lib, "webkit_web_view_is_loading");
+        if (is_loading && is_loading(w->priv->webview)) {
+            if (w->priv->deferred_count < 16) {
+                w->priv->deferred_js[w->priv->deferred_count++] = strdup(js);
+            }
+            return;
+        }
+    }
+
+    char uri[4096];
+    snprintf(uri, sizeof(uri), "javascript:%s;void(0)", js);
+    typedef void (*wk_load_uri_fn_t)(void*, const char*);
+    ((wk_load_uri_fn_t)w->priv->fn_wk_load_uri)(w->priv->webview, uri);
+}
+
 static int
 linux_backend_loop(webview_shim_t *w, int blocking)
 {
-    /* Drain any pending dispatch items first */
     wv_drain_dispatch(w->priv, w);
     if (blocking) {
-        gtk_main_iteration_fn_t gtk_main_iter =
-            (gtk_main_iteration_fn_t)w->priv->fn_gtk_main_iteration;
-        if (!gtk_main_iter) {
-            gtk_main_fn_t gtk_main = (gtk_main_fn_t)w->priv->fn_gtk_main;
-            if (gtk_main) { gtk_main(); return 1; }
-            return 1;
-        }
-        gtk_main_iter(1);
-        if (!w->priv->running) return 1;
-        return 0;
+        gtk_events_pending_fn_t p = (gtk_events_pending_fn_t)w->priv->fn_gtk_events_pending;
+        gtk_main_iteration_fn_t m = (gtk_main_iteration_fn_t)w->priv->fn_gtk_main_iteration;
+        if (p && p()) { if (m) m(0); } else { usleep(5000); }
     } else {
-        gtk_events_pending_fn_t gtk_events_pending =
-            (gtk_events_pending_fn_t)w->priv->fn_gtk_events_pending;
-        gtk_main_iteration_fn_t gtk_main_iter =
-            (gtk_main_iteration_fn_t)w->priv->fn_gtk_main_iteration;
-        if (gtk_events_pending && gtk_events_pending()) {
-            if (gtk_main_iter) gtk_main_iter(0);
+        gtk_events_pending_fn_t p = (gtk_events_pending_fn_t)w->priv->fn_gtk_events_pending;
+        gtk_main_iteration_fn_t m = (gtk_main_iteration_fn_t)w->priv->fn_gtk_main_iteration;
+        if (p && p()) { if (m) m(0); }
+    }
+    /* Poll document.title for JS→C invoke (zero signals) */
+    if (w->priv->running && w->priv->fn_wk_get_title && w->priv->webview
+        && (w->on_invoke || w->priv->bindings_count)) {
+        const char *title = ((const char *(*)(void*))w->priv->fn_wk_get_title)(w->priv->webview);
+        if (title && title[0] == 1) {
+            /* Compare with last seen — skip if unchanged */
+            if (w->priv->title_pending && !strcmp(title + 1, w->priv->title_last))
+                { /* duplicate, skip */ }
+            else {
+                w->priv->title_pending = 1;
+                size_t n = strlen(title + 1);
+                if (n >= sizeof(w->priv->title_last)) n = sizeof(w->priv->title_last) - 1;
+                memcpy(w->priv->title_last, title + 1, n);
+                w->priv->title_last[n] = 0;
+                wv_handle_invoke(w, title + 1);
+            }
+        } else {
+            w->priv->title_pending = 0;
+            w->priv->title_last[0] = 0;
         }
+    }
+    /* Flush deferred evals when page finishes loading */
+    if (w->priv->running && w->priv->deferred_count && w->priv->fn_wk_load_uri) {
+        typedef int (*wk_is_loading_fn_t)(void*);
+        wk_is_loading_fn_t is_loading = (wk_is_loading_fn_t)
+            cosmo_dlsym(w->priv->webkit_lib, "webkit_web_view_is_loading");
+        int loading = is_loading ? is_loading(w->priv->webview) : 0;
+        if (!loading) w->priv->page_has_loaded = 1;
+        if (w->priv->page_was_loading && !loading && w->priv->deferred_count) {
+            /* Page just finished loading, wait one iteration */
+            w->priv->page_was_loading = 0;
+        } else if (!w->priv->page_was_loading && !loading && w->priv->deferred_count) {
+            /* Page settled — execute all deferred JS in one javascript: URI
+               to avoid multiple navigations cancelling page content */
+            typedef void (*wk_load_uri_fn_t)(void*, const char*);
+            wk_load_uri_fn_t load_uri_fn = (wk_load_uri_fn_t)w->priv->fn_wk_load_uri;
+            char uri[4096];
+            int pos = snprintf(uri, sizeof(uri), "javascript:");
+            for (int i = 0; i < w->priv->deferred_count; i++) {
+                if (w->priv->deferred_js[i]) {
+                    pos += snprintf(uri + pos, sizeof(uri) - pos,
+                                   "%s;", w->priv->deferred_js[i]);
+                    free(w->priv->deferred_js[i]);
+                    w->priv->deferred_js[i] = NULL;
+                }
+            }
+            snprintf(uri + pos, sizeof(uri) - pos, "void(0)");
+            load_uri_fn(w->priv->webview, uri);
+            w->priv->deferred_count = 0;
+        }
+        w->priv->page_was_loading = loading;
     }
     if (!w->priv->running) return 1;
     return 0;
 }
 
 static void
-linux_backend_eval(webview_shim_t *w, const char *js)
-{
-    if (!js || !js[0]) return;
-
-    webkit_web_view_evaluate_javascript_fn_t wk_eval =
-        (webkit_web_view_evaluate_javascript_fn_t)w->priv->fn_wk_evaluate_javascript;
-    if (!wk_eval) {
-        typedef void (*wk_exec_fn_t)(void *, const char *);
-        wk_exec_fn_t wk_exec = (wk_exec_fn_t)cosmo_dlsym(w->priv->webkit_lib, "webkit_web_view_execute_script");
-        if (wk_exec && w->priv->webview) {
-            wk_exec(w->priv->webview, js);
-        }
-        return;
-    }
-
-    if (!w->priv->webview) return;
-    wk_eval(w->priv->webview, js, -1, NULL, NULL, NULL, NULL, NULL);
-}
-
-static void
 linux_backend_exit(webview_shim_t *w)
 {
-    gtk_main_quit_fn_t gtk_main_quit =
-        (gtk_main_quit_fn_t)w->priv->fn_gtk_main_quit;
-    if (gtk_main_quit) gtk_main_quit();
-
+    /* Do NOT call gtk_main_quit() — we use gtk_main_iteration(0) for
+       polling, not gtk_main(), so calling gtk_main_quit() triggers
+       'Gtk-CRITICAL: gtk_main_quit: assertion main_loops != NULL' */
     w->priv->running = 0;
     g_active_webview_gtk = NULL;
 }
@@ -1924,8 +2059,6 @@ linux_backend_init_script(webview_shim_t *w, const char *js)
     void *script = ((wk_user_script_new_fn_t)p->fn_wk_user_script_new)(js, 1, 0, NULL, NULL);
     if (!script) return -1;
     ((wk_ucm_add_script_fn_t)p->fn_wk_ucm_add_script)(ucm, script);
-    if (p->fn_g_object_unref)
-        ((g_object_unref_fn_t)p->fn_g_object_unref)(script);
     return 0;
 }
 
@@ -2020,7 +2153,7 @@ wv_inject_bind_js(webview_shim_t *w, const char *name)
     int n = snprintf(js, sizeof(js),
         "window.__wv_add_binding('%s');", name);
     if (n <= 0 || n >= (int)sizeof(js)) return -1;
-    /* Eval immediately — evaluateJavaScript queues if page hasn't loaded */
+    /* Eval immediately (defers automatically if page is still loading) */
     webview_shim_eval(w, js);
     /* Also register as init script so it persists across page reloads */
     webview_shim_init_script(w, js);
